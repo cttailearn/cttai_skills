@@ -1,6 +1,6 @@
 # CTTAI Skills Collection
 
-一个模块化的 AI 辅助开发与内容创作技能集合，包含 15 个专业技能，覆盖移动开发、前端工程、全栈架构、多媒体生成、文档处理、PPT 制作、Shader 图形编程以及微信内容创作等场景。
+一个模块化的 AI 辅助开发与内容创作技能集合，包含 17 个专业技能，覆盖移动开发、前端工程、全栈架构、多媒体生成、文档处理、PPT 制作、Shader 图形编程、微信内容创作、头条号发布以及 AI 自我改进等场景。
 
 ---
 
@@ -23,6 +23,8 @@
 | [wechat-draft-publisher](#wechat-draft-publisher) | `wechat-draft-publisher/` | 自动将 HTML 文章发布到微信公众平台草稿箱 |
 | [wechat-product-manager-writer](#wechat-product-manager-writer) | `wechat-product-manager-writer/` | 从 AI 产品经理视角撰写微信文章 |
 | [wechat-tech-writer](#wechat-tech-writer) | `wechat-tech-writer/` | 自动搜索、抓取并改写技术内容为微信文章 |
+| [self-improving-agent](#self-improving-agent) | `self-improving-agent/` | 持续改进：记录学习、错误与纠正，实现 AI 自我优化 |
+| [toutiao-publisher](#toutiao-publisher) | `toutiao-publisher/` | 基于 Playwright 的头条号自动化发布工具 |
 
 ---
 
@@ -237,6 +239,43 @@ GLSL Shader 图形编程技能。
 - 强制封面图生成
 - 每篇文章 0-2 张内容图（数据对比、架构图）
 - 纯文本链接格式（无 Markdown 超链接）
+
+---
+
+### self-improving-agent
+
+持续改进技能，记录学习、错误与纠正，实现 AI 自我优化。
+
+**核心能力**
+- **学习日志**：记录纠正、知识差距、最佳实践
+- **错误追踪**：命令失败、异常、API 问题
+- **功能请求**：用户请求但缺失的能力
+- **晋升机制**：将通用学习提升到项目记忆（CLAUDE.md、AGENTS.md）
+- **多 Agent 支持**：Claude Code、Codex、Copilot、OpenClaw
+
+**日志格式**
+- `LEARNINGS.md` — 纠正与最佳实践
+- `ERRORS.md` — 命令失败与异常
+- `FEATURE_REQUESTS.md` — 功能请求
+
+---
+
+### toutiao-publisher
+
+基于 Playwright 的头条号自动化发布工具，模拟真实用户行为进行发布。
+
+**核心能力**
+- **智能填充**：多级降级策略（execCommand > ClipboardEvent）确保内容注入成功
+- **封面自动化**：支持本地图片上传
+- **即时登录**：检测未登录状态自动暂停，等待用户扫码
+- **状态持久化**：Cookie 和 LocalStorage 复用，免登录
+- **反爬虫策略**：配置反检测浏览器上下文
+
+**工作流**
+1. 检测登录状态，未登录则等待扫码
+2. 填充标题与正文（支持 Markdown）
+3. 上传封面图片
+4. 点击发布并确认
 
 ---
 
