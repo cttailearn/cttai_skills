@@ -9,6 +9,9 @@ import sys
 import argparse
 import time
 import os
+import html
+import re
+from html.parser import HTMLParser
 from pathlib import Path
 
 # Add parent directory to path
@@ -23,6 +26,7 @@ from md2html import convert as md_to_html
 from exceptions import (
     ToutiaoPublisherError,
     AuthenticationError,
+    LoginTimeoutError,
     TitleInputError,
     ContentInjectError,
     CoverUploadError,
@@ -43,6 +47,218 @@ from utils import (
     retry_on_failure,
 )
 import selectors as sel
+
+
+class _TypableTextParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.list_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "br":
+            self.parts.append("\n")
+        elif tag == "li":
+            if self.parts and not self.parts[-1].endswith("\n"):
+                self.parts.append("\n")
+            prefix = "  " * max(0, self.list_depth - 1)
+            self.parts.append(f"{prefix}- ")
+        elif tag in {"ul", "ol"}:
+            self.list_depth += 1
+            if self.parts and not self.parts[-1].endswith("\n"):
+                self.parts.append("\n")
+        elif tag in {"p", "div", "section", "article", "pre", "blockquote"}:
+            if self.parts and not self.parts[-1].endswith("\n\n"):
+                self.parts.append("\n\n")
+        elif tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            if self.parts and not self.parts[-1].endswith("\n\n"):
+                self.parts.append("\n\n")
+
+    def handle_endtag(self, tag):
+        if tag in {"ul", "ol"} and self.list_depth > 0:
+            self.list_depth -= 1
+        if tag in {"p", "div", "section", "article", "pre", "blockquote", "li"}:
+            if not self.parts or not self.parts[-1].endswith("\n"):
+                self.parts.append("\n")
+        if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            if not self.parts or not self.parts[-1].endswith("\n\n"):
+                self.parts.append("\n\n")
+
+    def handle_data(self, data):
+        text = html.unescape(data.replace("\xa0", " "))
+        if text:
+            self.parts.append(text)
+
+    def get_text(self):
+        text = "".join(self.parts)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        lines = [line.rstrip() for line in text.splitlines()]
+        return "\n".join(lines).strip()
+
+
+def _html_to_typable_text(html_content: str) -> str:
+    parser = _TypableTextParser()
+    parser.feed(html_content or "")
+    plain_text = parser.get_text()
+    return plain_text or re.sub(r"<[^>]+>", "", html_content or "").strip()
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def _read_editor_state(page):
+    return page.evaluate(
+        r"""() => {
+            const editor = document.querySelector('.ProseMirror');
+            if (!editor) {
+                return { text: '', html: '', empty: true };
+            }
+            const text = (editor.innerText || editor.textContent || '').replace(/\u00a0/g, ' ');
+            const html = editor.innerHTML || '';
+            const meaningful = text.replace(/\s+/g, '').length === 0 && html.replace(/<[^>]+>/g, '').replace(/\s+/g, '').length === 0;
+            return { text, html, empty: meaningful };
+        }"""
+    )
+
+
+def _editor_has_meaningful_content(page, expected_text: str = "") -> bool:
+    state = _read_editor_state(page)
+    actual_text = _normalize_text(state.get("text", ""))
+    if not actual_text:
+        return False
+    if not expected_text:
+        return len(actual_text) >= 8
+    expected_normalized = _normalize_text(expected_text)
+    if not expected_normalized:
+        return len(actual_text) >= 8
+    if expected_normalized[:40] and expected_normalized[:40] in actual_text:
+        return True
+    return len(actual_text) >= max(20, int(len(expected_normalized) * 0.6))
+
+
+def _wait_for_editor_content(page, expected_text: str, timeout: float = 15) -> bool:
+    return wait_for_condition(
+        page,
+        lambda: _editor_has_meaningful_content(page, expected_text),
+        timeout=timeout,
+        interval=0.5,
+        raise_on_fail=False,
+    )
+
+
+def _clear_editor(page, editor):
+    editor.click()
+    page.keyboard.press("Control+A")
+    smart_delay(mean=0.3, std=0.05)
+    page.keyboard.press("Backspace")
+    wait_for_condition(
+        page,
+        lambda: not _editor_has_meaningful_content(page),
+        timeout=5,
+        interval=0.3,
+        raise_on_fail=False,
+    )
+
+
+def _paste_html_with_clipboard(page, editor, html_content: str, plain_text: str) -> bool:
+    wrote_clipboard = page.evaluate(
+        """async ({ html, text }) => {
+            try {
+                if (!navigator.clipboard || !window.ClipboardItem || !window.Blob) {
+                    return false;
+                }
+                const item = new ClipboardItem({
+                    'text/html': new Blob([html], { type: 'text/html' }),
+                    'text/plain': new Blob([text], { type: 'text/plain' }),
+                });
+                await navigator.clipboard.write([item]);
+                return true;
+            } catch (error) {
+                return false;
+            }
+        }""",
+        {"html": html_content, "text": plain_text},
+    )
+    if not wrote_clipboard:
+        return False
+    editor.click()
+    smart_delay(mean=0.5, std=0.1)
+    page.keyboard.press("Control+V")
+    return _wait_for_editor_content(page, plain_text, timeout=8)
+
+
+def _type_content_human_like(page, editor, plain_text: str) -> bool:
+    editor.click()
+    paragraphs = [paragraph for paragraph in re.split(r"\n{2,}", plain_text) if paragraph.strip()]
+    if not paragraphs and plain_text.strip():
+        paragraphs = [plain_text.strip()]
+    for index, paragraph in enumerate(paragraphs):
+        lines = paragraph.splitlines() or [paragraph]
+        for line_index, line in enumerate(lines):
+            if line:
+                page.keyboard.type(line, delay=18)
+            if line_index < len(lines) - 1:
+                page.keyboard.press("Shift+Enter")
+        if index < len(paragraphs) - 1:
+            page.keyboard.press("Enter")
+            page.keyboard.press("Enter")
+        if index and index % 4 == 0:
+            smart_delay(mean=0.35, std=0.08)
+    return _wait_for_editor_content(page, plain_text, timeout=10)
+
+
+def _has_visible_text(page, texts) -> str:
+    for text in texts:
+        try:
+            locator = page.get_by_text(text, exact=False).first
+            if locator.count() > 0 and locator.is_visible():
+                return text
+        except Exception:
+            continue
+    return ""
+
+
+def _wait_for_save_success(page, timeout: float = 12) -> bool:
+    success_texts = ["草稿已保存", "保存成功", "已保存"]
+    return wait_for_condition(
+        page,
+        lambda: bool(_has_visible_text(page, success_texts)),
+        timeout=timeout,
+        interval=0.5,
+        raise_on_fail=False,
+    )
+
+
+def _trigger_manual_save(page):
+    save_btn = find_element_with_fallback(page, sel.SAVE_DRAFT_SELECTORS, required=False)
+    if save_btn:
+        try:
+            if save_btn.is_visible() and save_btn.is_enabled():
+                logger.info("Clicking Save Draft button...")
+                save_btn.click()
+                return
+        except Exception:
+            pass
+    editor = page.locator(".ProseMirror").first
+    editor.click()
+    page.keyboard.type(" ", delay=20)
+    page.keyboard.press("Backspace")
+
+
+def _detect_publish_error(page) -> str:
+    return _has_visible_text(
+        page,
+        [
+            "保存失败",
+            "发布失败",
+            "内容不能为空",
+            "标题不能为空",
+            "请先保存",
+            "请完善文章内容",
+            "请稍后重试",
+        ],
+    )
 
 
 def publish(
@@ -80,7 +296,7 @@ def publish(
             logger.warning(f"Title extended to min 2 chars: '{original_title}' -> '{title}'")
 
     # Convert Markdown to HTML if needed
-    final_html = ""
+    final_html = content_html or ""
     if content_html and not raw:
         logger.info("Converting Markdown to HTML...")
         try:
@@ -282,44 +498,25 @@ def _fill_content(page, html_content) -> bool:
     logger.info("Filling article content...")
 
     try:
-        # Wait for editor
         wait_for_element(page, ".ProseMirror", timeout=10, state="attached")
-
         elem = find_element_with_fallback(page, sel.CONTENT_EDITOR_SELECTORS)
-        elem.click()
-        elem.clear()
+        plain_text = _html_to_typable_text(html_content)
+        strategies = [
+            ("clipboard paste", lambda: _paste_html_with_clipboard(page, elem, html_content, plain_text)),
+            ("human typing", lambda: _type_content_human_like(page, elem, plain_text)),
+        ]
 
-        # Inject content via JS
-        success = page.evaluate(
-            """(html) => {
-                const editor = document.querySelector('.ProseMirror');
-                if (editor) {
-                    editor.focus();
-                    const success = document.execCommand('insertHTML', false, html);
-                    if (!success) {
-                        const clipboardData = new DataTransfer();
-                        clipboardData.setData('text/html', html);
-                        const pasteEvent = new ClipboardEvent('paste', {
-                            bubbles: true, cancelable: true, clipboardData: clipboardData
-                        });
-                        editor.dispatchEvent(pasteEvent);
-                    }
-                    return true;
-                }
-                return false;
-            }""",
-            html_content,
-        )
+        for strategy_name, strategy in strategies:
+            logger.info(f"Trying content input strategy: {strategy_name}")
+            _clear_editor(page, elem)
+            if strategy():
+                logger.info(f"Editor accepted content via {strategy_name}")
+                smart_delay(mean=4, std=0.6)
+                _verify_draft_saved(page, plain_text)
+                return True
+            logger.warning(f"Content input strategy failed: {strategy_name}")
 
-        if not success:
-            raise ContentInjectError("Failed to inject content via JS")
-
-        logger.info("Content injected")
-        smart_delay(mean=3, std=0.5)
-
-        # Verify save status
-        _verify_draft_saved(page)
-        return True
+        raise ContentInjectError("Editor did not accept article content")
 
     except AllSelectorsFailedError:
         logger.error("Failed to fill content - editor not found")
@@ -330,39 +527,35 @@ def _fill_content(page, html_content) -> bool:
         raise ContentInjectError(err_msg)
 
 
-def _verify_draft_saved(page):
+def _verify_draft_saved(page, expected_text: str):
     """Verify that draft was saved."""
     logger.debug("Checking draft save status...")
 
-    for _ in range(10):
-        try:
-            if page.get_by_text("保存失败").is_visible():
-                logger.warning("Save failed detected, attempting recovery...")
-                _recover_from_save_failure(page)
-                return
+    if not _wait_for_editor_content(page, expected_text, timeout=10):
+        raise ContentInjectError("Editor did not retain the article content")
 
-            if page.get_by_text("草稿已保存").is_visible():
-                logger.info("Draft saved successfully")
-                return
-        except Exception:
-            pass
-        smart_delay(1)
+    for _ in range(3):
+        if _wait_for_save_success(page, timeout=12):
+            logger.info("Draft saved successfully")
+            return True
 
-    logger.warning("Could not verify draft save status")
+        logger.warning("Save not confirmed, attempting recovery...")
+        _recover_from_save_failure(page, expected_text)
+
+        if _wait_for_save_success(page, timeout=12):
+            logger.info("Draft saved successfully after recovery")
+            return True
+
+    raise ContentInjectError("Draft save could not be confirmed")
 
 
-def _recover_from_save_failure(page):
+def _recover_from_save_failure(page, expected_text: str):
     """Recover from save failure."""
     try:
-        save_btn = page.get_by_text("保存草稿")
-        if save_btn.is_visible():
-            logger.info("Clicking Save Draft button...")
-            save_btn.click()
-        else:
-            # Try typing space to trigger autosave
-            editor = page.locator(".ProseMirror").first
-            editor.type(" ")
-        smart_delay(3)
+        if not _wait_for_editor_content(page, expected_text, timeout=5):
+            raise ContentInjectError("Article content disappeared before draft save")
+        _trigger_manual_save(page)
+        smart_delay(mean=4, std=0.6)
     except Exception as e:
         logger.warning(f"Recovery failed: {e}")
 
@@ -434,7 +627,9 @@ def _execute_publish(page) -> bool:
     logger.info("Starting publish sequence...")
 
     try:
-        # Step 1: Click initial publish button
+        if _has_visible_text(page, ["保存失败", "保存草稿失败"]):
+            raise PublishError("Draft save failed, publish aborted")
+
         initial_btn = _find_publish_button(page)
         if initial_btn:
             logger.info("Clicking initial publish button...")
@@ -444,23 +639,32 @@ def _execute_publish(page) -> bool:
             page.evaluate("document.querySelector('.publish-btn')?.click()")
 
         logger.info("Waiting for interface response...")
-        smart_delay(mean=8, std=2)
+        smart_delay(mean=5, std=1)
 
-        # Step 2: Find and click final confirm button
+        publish_error = _detect_publish_error(page)
+        if publish_error:
+            raise PublishError(f"Publish blocked by page validation: {publish_error}")
+
+        if verify_publish_success(page, timeout=8):
+            logger.info("✨ Publish successful!")
+            return True
+
         if not _click_final_confirm(page):
             logger.error("Could not find final confirm button")
             raise PublishButtonError("Final confirm button not found")
 
         logger.info("Final button clicked, verifying success...")
-        smart_delay(mean=5, std=1)
+        smart_delay(mean=3, std=0.5)
 
-        # Step 3: Verify success
-        if verify_publish_success(page):
+        publish_error = _detect_publish_error(page)
+        if publish_error:
+            raise PublishError(f"Publish blocked by page validation: {publish_error}")
+
+        if verify_publish_success(page, timeout=20):
             logger.info("✨ Publish successful!")
             return True
-        else:
-            logger.warning("Could not verify publish success, assuming success")
-            return True
+
+        raise PublishError("Publish success could not be verified")
 
     except PublishButtonError:
         raise
@@ -488,28 +692,28 @@ def _find_publish_button(page):
 
 def _click_final_confirm(page) -> bool:
     """Click the final confirmation button."""
-    for selector in sel.FINAL_CONFIRM_BUTTON_SELECTORS:
-        try:
-            if selector["type"] == "css":
-                elem = page.locator(selector["value"]).first
-            elif selector["type"] == "text":
-                elem = page.get_by_text(selector["value"], exact=False)
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        for selector in sel.FINAL_CONFIRM_BUTTON_SELECTORS:
+            try:
+                if selector["type"] == "css":
+                    elem = page.locator(selector["value"]).first
+                elif selector["type"] == "text":
+                    elem = page.get_by_text(selector["value"], exact=False).first
+                else:
+                    continue
 
-            if elem.count() > 0 and elem.is_visible():
-                elem.click()
-                logger.info(f"Clicked final button: {selector['value']}")
-                return True
-        except Exception:
-            continue
+                if elem.count() > 0 and elem.is_visible():
+                    elem.click()
+                    logger.info(f"Clicked final button: {selector['value']}")
+                    return True
+            except Exception:
+                continue
 
-    # Try modal confirm as fallback
-    try:
-        modal = page.locator(".byte-modal .byte-btn-primary")
-        if modal.is_visible():
-            modal.click()
+        if verify_publish_success(page, timeout=1):
             return True
-    except Exception:
-        pass
+
+        time.sleep(0.5)
 
     return False
 

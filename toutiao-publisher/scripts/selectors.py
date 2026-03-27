@@ -30,6 +30,7 @@ FINAL_CONFIRM_BUTTON_SELECTORS = [
     {"type": "css", "value": ".publish-btn-last"},
     {"type": "text", "value": "确定"},
     {"type": "text", "value": "确认发布"},
+    {"type": "text", "value": "发布文章"},
     {"type": "css", "value": ".byte-modal .byte-btn-primary"},
 ]
 
@@ -73,6 +74,7 @@ OVERLAY_SELECTORS = [
 # Save draft button
 SAVE_DRAFT_SELECTORS = [
     {"type": "text", "value": "保存草稿"},
+    {"type": "text", "value": "存草稿"},
 ]
 
 # Success indicator text

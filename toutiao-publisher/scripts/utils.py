@@ -314,24 +314,30 @@ def verify_publish_success(page: Page, timeout: float = 10) -> bool:
         "主页查看",
         "查看已发布",
         "已发布",
+        "查看作品",
+        "作品管理",
     ]
 
-    # Check for success text
-    for text in success_indicators:
-        try:
-            if page.get_by_text(text, exact=False).is_visible(timeout=timeout * 1000):
-                logger.info(f"Publish success verified: found '{text}'")
-                return True
-        except Exception:
-            continue
+    published_indicators = ["published", "success", "published_v4", "article/manage"]
+    deadline = time.time() + timeout
 
-    # Check URL changed to published state
-    current_url = page.url
-    published_indicators = ["published", "success", "published_v4"]
-    for indicator in published_indicators:
-        if indicator in current_url.lower():
-            logger.info(f"Publish success verified: URL contains '{indicator}'")
-            return True
+    while time.time() < deadline:
+        for text in success_indicators:
+            try:
+                locator = page.get_by_text(text, exact=False).first
+                if locator.count() > 0 and locator.is_visible():
+                    logger.info(f"Publish success verified: found '{text}'")
+                    return True
+            except Exception:
+                continue
+
+        current_url = page.url
+        for indicator in published_indicators:
+            if indicator in current_url.lower():
+                logger.info(f"Publish success verified: URL contains '{indicator}'")
+                return True
+
+        time.sleep(0.5)
 
     logger.warning("Publish success could not be verified")
     return False
