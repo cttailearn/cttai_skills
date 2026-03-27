@@ -33,3 +33,9 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 LOGIN_TIMEOUT_MINUTES = 10
 PAGE_LOAD_TIMEOUT = 30000
 DEFAULT_TIMEOUT = 30000
+
+# State expiration
+STATE_EXPIRE_DAYS = 14  # Authentication state expires after this many days
+
+# Stealth configuration
+STEALTH_SCRIPTS_DIR = Path(__file__).parent / "stealth"

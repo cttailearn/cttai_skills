@@ -2,24 +2,47 @@
 """
 Publisher script for Toutiao
 Navigates to the publish page with authenticated session.
+Enhanced with structured error handling, logging, and selector fallback.
 """
 
 import sys
 import argparse
 import time
-from pathlib import Path
 import os
+from pathlib import Path
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import PUBLISH_URL
 from patchright.sync_api import sync_playwright
+
+from config import PUBLISH_URL
 from auth_manager import AuthManager
-from browser_utils import BrowserFactory
-
-
+from browser_utils import BrowserFactory, StealthUtils
 from md2html import convert as md_to_html
+from exceptions import (
+    ToutiaoPublisherError,
+    AuthenticationError,
+    TitleInputError,
+    ContentInjectError,
+    CoverUploadError,
+    PublishButtonError,
+    SelectorError,
+    AllSelectorsFailedError,
+    PublishError,
+)
+from utils import (
+    logger,
+    smart_delay,
+    wait_for_element,
+    wait_for_condition,
+    safe_goto,
+    find_element_with_fallback,
+    click_element_with_fallback,
+    verify_publish_success,
+    retry_on_failure,
+)
+import selectors as sel
 
 
 def publish(
@@ -33,495 +56,474 @@ def publish(
 ):
     """
     Launches a browser to the Toutiao publishing page and automates the posting process.
+
+    Args:
+        title: Article title
+        content_html: Article content (markdown or HTML)
+        cover_image_path: Path to cover image
+        dry_run: If True, fill fields but don't publish
+        headless: Run in headless mode
+        no_cover: Select 'No Cover' option
+        raw: If True, paste content as raw text without HTML conversion
+
+    Returns:
+        True if publish successful, False otherwise
     """
-    # Optimize title to meet Toutiao constraints (2-30 chars)
+    # Optimize title
     if title:
         original_title = title
         if len(title) > 30:
             title = title[:30]
-            print(
-                f"⚠️ Title optimized (truncated to 30 chars): '{original_title}' -> '{title}'"
-            )
+            logger.warning(f"Title truncated to 30 chars: '{original_title}' -> '{title}'")
         elif len(title) < 2:
             title = f"{title}..."
-            print(
-                f"⚠️ Title optimized (extended to min 2 chars): '{original_title}' -> '{title}'"
-            )
+            logger.warning(f"Title extended to min 2 chars: '{original_title}' -> '{title}'")
 
-    # Check if we have valid auth
-    auth_manager = AuthManager()
-    # Auto-login feature integrated, skipping strict pre-check
-    # if not auth_manager.is_authenticated():
-    #     print(
-    #         "❌ No valid authentication found. Please run 'auth_manager.py setup' first."
-    #     )
-    #     return False
-
-    # Convert Markdown to HTML if content is provided
+    # Convert Markdown to HTML if needed
     final_html = ""
     if content_html and not raw:
-        print("🔄 Converting Markdown to HTML...")
+        logger.info("Converting Markdown to HTML...")
         try:
             final_html = md_to_html(content_html)
-            print(f"  HTML preview: {final_html[:100]}...")
+            logger.debug(f"HTML preview: {final_html[:100]}...")
         except Exception as e:
-            print(f"⚠️ Conversion failed, using raw text: {e}")
+            logger.warning(f"Conversion failed, using raw text: {e}")
             final_html = content_html
 
-    print(f"🚀 Launching Toutiao Publisher (Headless: {headless})...")
+    logger.info(f"Launching Toutiao Publisher (Headless: {headless})...")
 
-    with sync_playwright() as p:
-        context = BrowserFactory.launch_persistent_context(p, headless=headless)
-
-        # Get the page (persistent context usually has one page open or we create one)
+    context = None
+    playwright = None
+    try:
+        playwright = sync_playwright().start()
+        context = BrowserFactory.launch_persistent_context(playwright, headless=headless)
         page = context.pages[0] if context.pages else context.new_page()
 
-        # Helper for screenshot
-        def take_screenshot(name):
-            try:
-                # Use timestamp to avoid overwrites
-                ts = int(time.time())
-                filename = f"debug_{name}_{ts}.png"
-                # Save in current directory
-                page.screenshot(path=filename)
-                print(f"  📸 Saved screenshot: {filename}")
-            except Exception as e:
-                print(f"  ⚠️ Screenshot failed: {e}")
+        # Inject stealth scripts manually as extra measure
+        StealthUtils.inject_stealth_scripts(page)
 
+        # Navigate to publishing page
+        logger.info(f"Navigating to publish page...")
+        safe_goto(page, PUBLISH_URL, timeout=60)
+
+        # Handle login redirect
+        if not _handle_login_redirect(page, context, headless):
+            if headless:
+                logger.warning("Cannot proceed in headless mode without valid authentication")
+            logger.error("Login redirect handling failed")
+            return False
+
+        logger.info("Publishing page loaded")
+        smart_delay(mean=2.5, std=0.5)
+
+        # Handle overlays
+        _handle_overlays(page)
+
+        # 1. Fill Title
+        if title:
+            _fill_title(page, title)
+
+        # 2. Fill Content
+        if content_html:
+            _fill_content(page, final_html)
+
+        # 3. Handle Cover
+        if cover_image_path:
+            _upload_cover(page, cover_image_path)
+        elif no_cover:
+            _select_no_cover(page)
+
+        # 4. Publish
+        if not dry_run:
+            success = _execute_publish(page)
+        else:
+            logger.info("Dry run: skipping final publish")
+            smart_delay(5)
+            success = True
+
+        # Keep browser open for inspection in non-headless mode
+        if not headless and success:
+            logger.info("Browser open for inspection. Closing in 60s...")
+            time.sleep(60)
+
+        return success
+
+    except AllSelectorsFailedError as e:
+        logger.error(f"Element selection failed: {e}")
+        return False
+    except AuthenticationError as e:
+        logger.error(f"Authentication error: {e}")
+        return False
+    except PublishError as e:
+        logger.error(f"Publish error: {e}")
+        return False
+    except ToutiaoPublisherError as e:
+        logger.error(f"Publisher error: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    finally:
+        # Clean up browser resources
+        if context:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if playwright:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+
+def _handle_login_redirect(page, context, headless) -> bool:
+    """Handle redirect to login page.
+
+    In headless mode (Linux servers, CI/CD), we rely on pre-saved cookies
+    and cannot perform interactive login. If cookies are valid, the page
+    should not redirect to login.
+
+    Args:
+        page: Playwright page object
+        context: Browser context with cookies
+        headless: Whether running in headless mode
+
+    Returns:
+        True if authenticated and can continue, False otherwise
+    """
+    current_url = page.url
+    login_patterns = ["auth/page/login", "sso.toutiao.com"]
+
+    if not any(pattern in current_url for pattern in login_patterns):
+        return True
+
+    # Already on login page - cookies may be invalid or expired
+    if headless:
+        logger.warning("Redirected to login page in headless mode.")
+        logger.warning("Cannot perform interactive login in headless mode.")
+        logger.warning("Please ensure cookies are valid and not expired.")
+        return False
+
+    # Non-headless mode: wait for user to login manually
+    logger.warning("Redirected to login page, waiting for user login...")
+    logger.info("Please scan QR code in the browser window")
+
+    start_time = time.time()
+    timeout = 300  # 5 minutes
+
+    while time.time() - start_time < timeout:
         try:
-            # Navigate to publishing page
-            print(f"🌐 Navigating to {PUBLISH_URL}...")
-            try:
-                page.goto(PUBLISH_URL, timeout=60000)
-                # Relaxed wait condition as networkidle is too strict for Toutiao
-                page.wait_for_load_state("domcontentloaded")
-            except Exception as e:
-                print(f"⚠️ Navigation warning (proceeding anyway): {e}")
+            current_url = page.url
+            if "profile_v4" in current_url or "graphic/publish" in current_url:
+                logger.info("Login detected!")
+                _save_state(context)
+                return True
 
-            # Check if we were redirected to login
-            if "auth/page/login" in page.url or "sso.toutiao.com" in page.url:
-                print("⚠️ Redirected to login page.")
-                if headless:
-                    print(
-                        "❌ Cannot login in headless mode. Please run without --headless."
-                    )
-                    return False
+            if PUBLISH_URL in current_url:
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
 
-                print("⏳ Waiting for user login (5 mins)...")
-                print("   Please scan QR code in the browser window.")
+    logger.error("Login timeout")
+    raise LoginTimeoutError("Login timeout", details={"timeout": timeout})
 
-                start_time = time.time()
-                logged_in = False
-                while time.time() - start_time < 300:
-                    try:
-                        # Check indicators
-                        if (
-                            "profile_v4" in page.url
-                            or "mp.toutiao.com/graphic/publish" in page.url
-                        ):
-                            print("✅ Detected login! Saving state...")
-                            # Save state for future use
-                            try:
-                                state_path = Path("data/browser_state/state.json")
-                                state_path.parent.mkdir(parents=True, exist_ok=True)
-                                context.storage_state(path=str(state_path))
-                                print("   State saved.")
-                            except Exception as e:
-                                print(f"   Warning: Could not save state: {e}")
 
-                            logged_in = True
-                            break
+def _save_state(context):
+    """Save browser state."""
+    try:
+        state_path = Path("data/browser_state/state.json")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        context.storage_state(path=str(state_path))
+        logger.info("Browser state saved")
+    except Exception as e:
+        logger.warning(f"Could not save state: {e}")
 
-                        # Also check if we are back on publish page
-                        if PUBLISH_URL in page.url:
-                            logged_in = True
-                            break
-                    except:
-                        pass
-                    time.sleep(1)
 
-                if not logged_in:
-                    print("❌ Login timeout.")
-                    return False
+def _handle_overlays(page):
+    """Handle obstructing overlays."""
+    logger.debug("Checking for overlays...")
 
-                # If we logged in but are not on publish page, go there
-                if PUBLISH_URL not in page.url:
-                    print(f"🔄 Redirecting to publish page: {PUBLISH_URL}")
-                    page.goto(PUBLISH_URL)
-                    page.wait_for_load_state("networkidle")
+    for selector in sel.OVERLAY_SELECTORS:
+        try:
+            elem = page.locator(selector["value"]).first
+            if elem.count() > 0 and elem.is_visible():
+                logger.info(f"Found overlay: {selector['value']}")
+                elem.click(force=True, position={"x": 10, "y": 10})
+                page.evaluate(f"document.querySelector('{selector['value']}')?.remove()")
+                smart_delay(mean=1, std=0.3)
+        except Exception:
+            pass
 
-            print("✅ Publishing page loaded.")
-            time.sleep(3)  # Wait a bit for dynamic content
 
-            # Handle potential overlays (e.g. AI assistant drawer)
-            print("  Checking for obstructing overlays...")
-            try:
-                # Common overlay selectors
-                overlays = [
-                    ".byte-drawer-mask",
-                    ".ai-assistant-drawer",
-                    ".byte-modal-mask",
-                ]
-                for sel in overlays:
-                    if page.locator(sel).is_visible():
-                        print(f"  ⚠️ Found overlay: {sel}. Attempting to close/hide...")
-                        # Try clicking it to dismiss
-                        page.locator(sel).click(force=True, position={"x": 10, "y": 10})
-                        # Or execute JS to remove
-                        page.evaluate(f"document.querySelector('{sel}')?.remove()")
-                        time.sleep(1)
-            except Exception as e:
-                print(f"  ⚠️ Error handling overlays: {e}")
+def _fill_title(page, title) -> bool:
+    """Fill the title input field."""
+    logger.info(f"Filling title: {title[:20]}...")
 
-            # 1. Fill Title
-            if title:
-                print(f"✍️ Filling title: {title[:20]}...")
-                try:
-                    title_filled = False
+    try:
+        elem = find_element_with_fallback(page, sel.TITLE_INPUT_SELECTORS)
+        elem.fill(title)
+        logger.info("Title filled successfully")
+        return True
+    except AllSelectorsFailedError as ex:
+        logger.error("Failed to fill title - all selectors failed")
+        raise TitleInputError("Failed to fill title", details={"title": title}) from ex
+    except Exception:
+        import traceback
+        logger.error(f"Failed to fill title. Traceback: {traceback.format_exc()}")
+        raise TitleInputError("Failed to fill title", details={"title": title})
 
-                    # Method A: Placeholder Contains "标题"
-                    print("  Attempting to fill title...")
-                    title_input = page.locator("textarea").first
-                    if title_input.count() > 0:
-                        title_input.fill(title)
-                        title_filled = True
-                        print("  Filled first textarea with title.")
-                    else:
-                        # Fallback
-                        print("  Falling back to placeholder search...")
-                        title_input_ph = page.get_by_placeholder("标题", exact=False)
-                        if title_input_ph.count() > 0:
-                            title_input_ph.first.fill(title)
-                            title_filled = True
-                            print("  Filled by placeholder.")
 
-                    if not title_filled:
-                        print("❌ Could not identify title input.")
+def _fill_content(page, html_content) -> bool:
+    """Fill the content editor."""
+    logger.info("Filling article content...")
 
-                except Exception as e:
-                    print(f"⚠️ Failed to fill title: {e}")
+    try:
+        # Wait for editor
+        wait_for_element(page, ".ProseMirror", timeout=10, state="attached")
 
-                take_screenshot("after_title")
+        elem = find_element_with_fallback(page, sel.CONTENT_EDITOR_SELECTORS)
+        elem.click()
+        elem.clear()
 
-            # 2. Fill Content
-            if content_html:
-                print("📝 Filling article content with HTML paste...")
-                try:
-                    # Toutiao uses ProseMirror
-                    # Wait for it to appear
-                    try:
-                        page.wait_for_selector(".ProseMirror", timeout=5000)
-                    except Exception:
-                        print("  ⚠️ Timeout waiting for .ProseMirror")
+        # Inject content via JS
+        success = page.evaluate(
+            """(html) => {
+                const editor = document.querySelector('.ProseMirror');
+                if (editor) {
+                    editor.focus();
+                    const success = document.execCommand('insertHTML', false, html);
+                    if (!success) {
+                        const clipboardData = new DataTransfer();
+                        clipboardData.setData('text/html', html);
+                        const pasteEvent = new ClipboardEvent('paste', {
+                            bubbles: true, cancelable: true, clipboardData: clipboardData
+                        });
+                        editor.dispatchEvent(pasteEvent);
+                    }
+                    return true;
+                }
+                return false;
+            }""",
+            html_content,
+        )
 
-                    editor = page.locator(".ProseMirror").first
-                    if editor.count() > 0:
-                        editor.click()
-                        editor.clear()
+        if not success:
+            raise ContentInjectError("Failed to inject content via JS")
 
-                        # Prepare plain text version (original markdown or stripped)
-                        # We pass 'content_html' (which is actually the raw text/markdown passed to func if conversion failed,
-                        # but in our flow 'content_html' arg to publish() IS the markdown if we called it right)
-                        # Wait, let's look at the arguments.
-                        # publish(content_html=...) receives the raw file content.
-                        # Then we convert it to 'final_html'.
-                        # So 'content_html' is the plain text source.
+        logger.info("Content injected")
+        smart_delay(mean=3, std=0.5)
 
-                        # Use robust argument passing to avoid JS parsing errors
-                        print("  Attempting content fill via execCommand...")
+        # Verify save status
+        _verify_draft_saved(page)
+        return True
 
-                        # Pass data safely to JS environment
-                        eval_args = {"html": final_html}
+    except AllSelectorsFailedError:
+        logger.error("Failed to fill content - editor not found")
+        raise ContentInjectError("Content editor not found")
+    except Exception as ex:
+        err_msg = str(ex)
+        logger.error(f"Failed to fill content: {err_msg}")
+        raise ContentInjectError(err_msg)
 
-                        filled = page.evaluate(
-                            """(data) => {
-                            const editor = document.querySelector('.ProseMirror');
-                            if (editor) {
-                                editor.focus();
-                                // Try insertHTML first - usually most reliable for WYSIWYG
-                                const success = document.execCommand('insertHTML', false, data.html);
-                                if (!success) {
-                                    // Fallback to clipboard event
-                                    console.log('execCommand failed, trying clipboard event');
-                                    const clipboardData = new DataTransfer();
-                                    clipboardData.setData('text/html', data.html);
-                                    // Create paste event
-                                    const pasteEvent = new ClipboardEvent('paste', {
-                                        bubbles: true,
-                                        cancelable: true,
-                                        clipboardData: clipboardData
-                                    });
-                                    editor.dispatchEvent(pasteEvent);
-                                }
-                                return true;
-                            }
-                            return false;
-                        }""",
-                            eval_args,
-                        )
 
-                        time.sleep(3)
-                        print("✅ Content pasted via JS event.")
+def _verify_draft_saved(page):
+    """Verify that draft was saved."""
+    logger.debug("Checking draft save status...")
 
-                        # Verify Draft Saved Status
-                        print("  Checking save status...")
-                        saved_successfully = False
-                        for _ in range(10):
-                            if page.get_by_text("保存失败").is_visible():
-                                print("❌ Alert: 'Save Failed' detected!")
-                                take_screenshot("save_failed")
+    for _ in range(10):
+        try:
+            if page.get_by_text("保存失败").is_visible():
+                logger.warning("Save failed detected, attempting recovery...")
+                _recover_from_save_failure(page)
+                return
 
-                                # Attempt retrieval: Click "Save Draft" button if exists
-                                save_btn = page.get_by_text("保存草稿")
-                                if save_btn.is_visible():
-                                    print("  Clicking 'Save Draft' manually...")
-                                    save_btn.click()
-                                else:
-                                    # Try typing a space
-                                    print("  Typing space to trigger autosave...")
-                                    editor.type(" ")
-                                time.sleep(3)
+            if page.get_by_text("草稿已保存").is_visible():
+                logger.info("Draft saved successfully")
+                return
+        except Exception:
+            pass
+        smart_delay(1)
 
-                            if page.get_by_text("草稿已保存").is_visible():
-                                print("✅ Draft saved successfully.")
-                                saved_successfully = True
-                                break
-                            time.sleep(1)
+    logger.warning("Could not verify draft save status")
 
-                        if not saved_successfully:
-                            print(
-                                "⚠️ Warning: content might not be saved. Publishing might fail."
-                            )
 
-                    else:
-                        print("⚠️ ProseMirror editor not found.")
-                except Exception as e:
-                    print(f"⚠️ Failed to fill content: {e}")
+def _recover_from_save_failure(page):
+    """Recover from save failure."""
+    try:
+        save_btn = page.get_by_text("保存草稿")
+        if save_btn.is_visible():
+            logger.info("Clicking Save Draft button...")
+            save_btn.click()
+        else:
+            # Try typing space to trigger autosave
+            editor = page.locator(".ProseMirror").first
+            editor.type(" ")
+        smart_delay(3)
+    except Exception as e:
+        logger.warning(f"Recovery failed: {e}")
 
-                take_screenshot("after_content")
 
-            # 3. Cover Image Processing
-            if cover_image_path:
-                print(f"🖼️ Uploading cover image: {cover_image_path}...")
-                try:
-                    # check if file exists
-                    if not os.path.exists(cover_image_path):
-                        print(f"  ❌ Cover image not found at: {cover_image_path}")
-                    else:
-                        # 3.1 Click "Add Cover" area
-                        print("  Clicking 'Add Cover' area...")
-                        add_cover_btn = page.locator("div.article-cover-add").first
-                        if add_cover_btn.is_visible():
-                            add_cover_btn.click()
-                        else:
-                            # Try finding by text if class selector fails
-                            page.locator("div, span").filter(
-                                has_text="添加封面"
-                            ).last.click()
-                        time.sleep(1)
+def _upload_cover(page, image_path) -> bool:
+    """Upload cover image."""
+    logger.info(f"Uploading cover: {image_path}")
 
-                        # 3.2 Select "Upload Local Image" tab/button
-                        print("  Clicking 'Upload Local' button...")
-                        # Try the specific class from reference
-                        upload_tab = page.locator(
-                            "div.btn-upload-handle.upload-handler"
-                        ).first
-                        if upload_tab.is_visible():
-                            upload_tab.click()
-                        else:
-                            # Fallback text search
-                            page.locator("div, span").filter(
-                                has_text="本地上传"
-                            ).last.click()
-                        time.sleep(1)
+    if not os.path.exists(image_path):
+        logger.error(f"Cover image not found: {image_path}")
+        raise CoverUploadError(f"File not found: {image_path}")
 
-                        # 3.3 Upload File
-                        print("  Setting file input...")
-                        # Playwright handles file uploads gracefully with set_input_files
-                        # We look for the file input inside the upload handler or globally
-                        file_input = page.locator("input[type='file']").first
-                        file_input.set_input_files(cover_image_path)
-                        print("  File sent to input.")
+    try:
+        # Click Add Cover
+        elem = find_element_with_fallback(page, sel.ADD_COVER_SELECTORS)
+        elem.click()
+        smart_delay(1)
 
-                        # 3.4 Confirm Upload
-                        print("  Waiting for confirm button...")
-                        # Reference script used: button[data-e2e='imageUploadConfirm-btn']
-                        confirm_btn = page.locator(
-                            "button[data-e2e='imageUploadConfirm-btn']"
-                        )
+        # Click Upload Local
+        elem = find_element_with_fallback(page, sel.UPLOAD_LOCAL_SELECTORS)
+        elem.click()
+        smart_delay(1)
 
-                        # Wait for it to be clickable (upload processing)
-                        try:
-                            confirm_btn.wait_for(state="visible", timeout=30000)
-                            # Sometimes button is disabled while processing
-                            time.sleep(2)
-                            confirm_btn.click()
-                            print("  ✅ Cover image uploaded and confirmed.")
-                        except Exception as e:
-                            print(f"  ⚠️ Confirm button issue: {e}")
-                            # Try fallback confirm button
-                            page.locator("button.byte-btn-primary").filter(
-                                has_text="确定"
-                            ).last.click()
+        # Upload file
+        file_input = page.locator("input[type='file']").first
+        file_input.set_input_files(image_path)
+        logger.info("File sent to input")
 
-                        time.sleep(2)
-                        take_screenshot("cover_uploaded")
+        # Confirm upload
+        smart_delay(2)
+        try:
+            confirm_btn = page.locator("button[data-e2e='imageUploadConfirm-btn']")
+            if confirm_btn.is_visible(timeout=30000):
+                confirm_btn.click()
+        except Exception:
+            # Fallback
+            page.locator(".byte-btn-primary").filter(has_text="确定").last.click()
 
-                except Exception as e:
-                    print(f"⚠️ Failed to upload cover: {e}")
+        logger.info("Cover uploaded")
+        smart_delay(2)
+        return True
 
-            elif no_cover:
-                print("🖼️ Selecting 'No Cover' (无封面) mode...")
-                try:
-                    # Robust selection for No Cover
-                    no_cover_loc = (
-                        page.locator("div, span, label").filter(has_text="无封面").last
-                    )
-                    if no_cover_loc.is_visible():
-                        no_cover_loc.click()
-                        print("  Clicked '无封面' option.")
-                    else:
-                        # Fallback: try checking if a radio exists
-                        page.locator("input[type='radio'][value='0']").click()
+    except AllSelectorsFailedError:
+        logger.error("Cover upload UI elements not found")
+        raise CoverUploadError("Cover upload UI not found")
+    except Exception as ex:
+        err_msg = str(ex)
+        logger.error(f"Cover upload failed: {err_msg}")
+        raise CoverUploadError(err_msg)
 
-                    time.sleep(2)
-                    take_screenshot("cover_mode_selected")
-                except Exception as e:
-                    print(f"⚠️ Failed to select no cover: {e}")
 
-            # 4. Final Publish Step (Optimized Two-Step Flow)
-            if not dry_run:
-                print("🚀 Submitting article (Final Step)...")
-                try:
-                    take_screenshot("before_publish_click")
+def _select_no_cover(page) -> bool:
+    """Select no cover option."""
+    logger.info("Selecting 'No Cover' option...")
 
-                    # Step 4.1: Click "Preview & Publish" or "Publish"
-                    print("  Step 1: Clicking initial Publish/Preview button...")
+    try:
+        elem = find_element_with_fallback(page, sel.NO_COVER_SELECTORS)
+        elem.click()
+        logger.info("No cover selected")
+        smart_delay(2)
+        return True
+    except AllSelectorsFailedError:
+        logger.warning("Could not select no cover option")
+        return False
 
-                    # Strategy: Try specific text locators first
-                    # "预览并发布" (Preview & Publish) is preferred
-                    initial_btn = (
-                        page.locator("button").filter(has_text="预览并发布").last
-                    )
-                    if not initial_btn.is_visible():
-                        print(
-                            "  'Preview & Publish' not found, trying generic 'Publish'..."
-                        )
-                        # Exclude modal buttons logic can be complex in generic selectors,
-                        # but usually the main publish button is prominent
-                        initial_btn = (
-                            page.locator("button").filter(has_text="发布").last
-                        )
 
-                    if initial_btn.is_visible() and initial_btn.is_enabled():
-                        initial_btn.click()
-                        print("  ✅ Initial button clicked.")
-                    else:
-                        print(
-                            "  ⚠️ Could not find initial publish button! Attempting blind JS click on .publish-btn..."
-                        )
-                        page.evaluate("document.querySelector('.publish-btn')?.click()")
+def _execute_publish(page) -> bool:
+    """Execute the publish sequence."""
+    logger.info("Starting publish sequence...")
 
-                    # Step 4.2: Wait for potential preview/modal
-                    print("  Waiting for interface response (10s)...")
-                    time.sleep(10)
+    try:
+        # Step 1: Click initial publish button
+        initial_btn = _find_publish_button(page)
+        if initial_btn:
+            logger.info("Clicking initial publish button...")
+            initial_btn.click()
+        else:
+            logger.warning("Publish button not found, attempting JS click")
+            page.evaluate("document.querySelector('.publish-btn')?.click()")
 
-                    # Step 4.3: Final Confirmation Button
-                    print("  Step 2: Looking for Final Confirm button...")
-                    # Reference script indicates class: .publish-btn-last
-                    final_btn = page.locator(".publish-btn-last").first
+        logger.info("Waiting for interface response...")
+        smart_delay(mean=8, std=2)
 
-                    if final_btn.is_visible():
-                        print("  Found .publish-btn-last. Clicking...")
-                        final_btn.click()
-                    else:
-                        # Fallback: Look for the primary button in a modal
-                        print(
-                            "  Main locator failed. Checking for modal confirmation..."
-                        )
-                        modal_confirm = (
-                            page.locator(".byte-modal .byte-btn-primary")
-                            .filter(has_text="确定")
-                            .or_(
-                                page.locator(".byte-modal .byte-btn-primary").filter(
-                                    has_text="确认发布"
-                                )
-                            )
-                            .last
-                        )
+        # Step 2: Find and click final confirm button
+        if not _click_final_confirm(page):
+            logger.error("Could not find final confirm button")
+            raise PublishButtonError("Final confirm button not found")
 
-                        if modal_confirm.is_visible():
-                            print("  Found modal confirm button. Clicking...")
-                            modal_confirm.click()
-                        else:
-                            print(
-                                "  ❌ Critical: Could not find final confirmation button!"
-                            )
-                            return False
+        logger.info("Final button clicked, verifying success...")
+        smart_delay(mean=5, std=1)
 
-                    # Success Check
-                    print("  Checking for success indicators...")
-                    time.sleep(5)
-                    take_screenshot("final_result")
-
-                    # Common success texts
-                    success_texts = ["发布成功", "主页查看", "已发布"]
-                    for text in success_texts:
-                        if page.get_by_text(text).is_visible():
-                            print(f"✨ Publish Successful! Found text: {text}")
-                            return True
-
-                    return (
-                        True  # Assume success if we clicked final button without error
-                    )
-
-                except Exception as e:
-                    print(f"❌ Failed during publish sequence: {e}")
-                    import traceback
-
-                    traceback.print_exc()
-                    return False
-            else:
-                print("🚧 Dry run: Skipping final publish click.")
-                time.sleep(5)
-
-            print("✨ Operation completed.")
+        # Step 3: Verify success
+        if verify_publish_success(page):
+            logger.info("✨ Publish successful!")
+            return True
+        else:
+            logger.warning("Could not verify publish success, assuming success")
             return True
 
-        except Exception as e:
-            print(f"❌ Error during publishing: {e}")
-            import traceback
+    except PublishButtonError:
+        raise
+    except Exception as ex:
+        err_msg = str(ex)
+        logger.error(f"Publish sequence failed: {err_msg}")
+        raise PublishError(err_msg)
 
-            traceback.print_exc()
-            return False
-        finally:
-            if not headless:
-                print("browser open for inspection. Closing in 60s...")
-                time.sleep(60)
-            if context:
-                context.close()
+
+def _find_publish_button(page):
+    """Find the publish button with fallback."""
+    for selector in sel.PUBLISH_BUTTON_SELECTORS:
+        try:
+            if selector["type"] == "text":
+                elem = page.locator("button").filter(has_text=selector["value"]).last
+            else:
+                elem = page.locator(selector["value"]).first
+
+            if elem.count() > 0 and elem.is_visible() and elem.is_enabled():
+                return elem
+        except Exception:
+            continue
+    return None
+
+
+def _click_final_confirm(page) -> bool:
+    """Click the final confirmation button."""
+    for selector in sel.FINAL_CONFIRM_BUTTON_SELECTORS:
+        try:
+            if selector["type"] == "css":
+                elem = page.locator(selector["value"]).first
+            elif selector["type"] == "text":
+                elem = page.get_by_text(selector["value"], exact=False)
+
+            if elem.count() > 0 and elem.is_visible():
+                elem.click()
+                logger.info(f"Clicked final button: {selector['value']}")
+                return True
+        except Exception:
+            continue
+
+    # Try modal confirm as fallback
+    try:
+        modal = page.locator(".byte-modal .byte-btn-primary")
+        if modal.is_visible():
+            modal.click()
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def main():
+    """Command-line interface."""
     parser = argparse.ArgumentParser(description="Toutiao Article Publisher")
     parser.add_argument("--title", help="Article title")
     parser.add_argument("--content", help="Article content (string or file path)")
     parser.add_argument("--cover", help="Path to cover image")
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Fill fields but do not publish"
-    )
-    # Add headless and no-cover arguments
-    parser.add_argument(
-        "--headless", action="store_true", help="Run in headless mode (no UI)"
-    )
-    parser.add_argument(
-        "--no-cover", action="store_true", help="Select 'No Cover' option"
-    )
-    parser.add_argument(
-        "--raw",
-        action="store_true",
-        help="Paste content as raw text (no HTML conversion)",
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Fill but don't publish")
+    parser.add_argument("--headless", action="store_true", help="Run headless")
+    parser.add_argument("--no-cover", action="store_true", help="No cover")
+    parser.add_argument("--raw", action="store_true", help="Raw text content")
 
     args = parser.parse_args()
 
@@ -530,7 +532,7 @@ def main():
         with open(content, "r", encoding="utf-8") as f:
             content = f.read()
 
-    publish(
+    success = publish(
         title=args.title,
         content_html=content,
         cover_image_path=args.cover,
@@ -539,6 +541,12 @@ def main():
         no_cover=args.no_cover,
         raw=args.raw,
     )
+
+    if success:
+        logger.info("Operation completed successfully")
+    else:
+        logger.error("Operation failed")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

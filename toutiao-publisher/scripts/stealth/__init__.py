@@ -1,0 +1,3 @@
+"""
+Stealth module initialization
+"""

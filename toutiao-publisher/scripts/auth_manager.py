@@ -25,7 +25,10 @@ from config import (
     DATA_DIR,
     LOGIN_URL,
     HOME_URL,
+    STATE_EXPIRE_DAYS,
 )
+from exceptions import AuthenticationError, LoginTimeoutError
+from utils import logger
 from browser_utils import BrowserFactory
 
 
@@ -49,12 +52,10 @@ class AuthManager:
         if not self.state_file.exists():
             return False
 
-        # Check if state file is not too old (7 days)
+        # Check if state file is not too old
         age_days = (time.time() - self.state_file.stat().st_mtime) / 86400
-        if age_days > 7:
-            print(
-                f"⚠️ Browser state is {age_days:.1f} days old, may need re-authentication"
-            )
+        if age_days > STATE_EXPIRE_DAYS:
+            logger.warning(f"Browser state is {age_days:.1f} days old, may need re-authentication")
 
         return True
 
