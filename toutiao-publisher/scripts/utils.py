@@ -236,9 +236,12 @@ def find_element_with_fallback(
             else:
                 continue
 
-            if elem.count() > 0 and elem.is_visible():
-                logger.debug(f"Selector succeeded: {selector_type}={value}")
-                return elem
+            match_count = elem.count()
+            for index in range(min(match_count, 5)):
+                candidate = elem.nth(index)
+                if candidate.is_visible():
+                    logger.debug(f"Selector succeeded: {selector_type}={value} [index={index}]")
+                    return candidate
 
         except Exception as e:
             err_str = str(e)

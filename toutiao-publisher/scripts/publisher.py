@@ -137,6 +137,52 @@ def _editor_has_meaningful_content(page, expected_text: str = "") -> bool:
     return len(actual_text) >= max(20, int(len(expected_normalized) * 0.6))
 
 
+def _wait_for_title_ready(page, timeout: float = 15) -> bool:
+    return wait_for_condition(
+        page,
+        lambda: page.evaluate(
+            """() => Boolean(document.querySelector("textarea[placeholder*='标题'], textarea"))"""
+        ),
+        timeout=timeout,
+        interval=0.5,
+        raise_on_fail=False,
+    )
+
+
+def _wait_for_editor_ready(page, timeout: float = 15) -> bool:
+    return wait_for_condition(
+        page,
+        lambda: page.evaluate("""() => Boolean(document.querySelector('.ProseMirror'))"""),
+        timeout=timeout,
+        interval=0.5,
+        raise_on_fail=False,
+    )
+
+
+def _focus_editor(page) -> bool:
+    if not _wait_for_editor_ready(page, timeout=10):
+        return False
+    try:
+        return page.evaluate(
+            """() => {
+                const editor = document.querySelector('.ProseMirror');
+                if (!editor) {
+                    return false;
+                }
+                editor.focus();
+                const selection = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(editor);
+                range.collapse(false);
+                selection.removeAllRanges();
+                selection.addRange(range);
+                return document.activeElement === editor;
+            }"""
+        )
+    except Exception:
+        return False
+
+
 def _wait_for_editor_content(page, expected_text: str, timeout: float = 15) -> bool:
     return wait_for_condition(
         page,
@@ -148,7 +194,9 @@ def _wait_for_editor_content(page, expected_text: str, timeout: float = 15) -> b
 
 
 def _clear_editor(page, editor):
-    editor.click()
+    _handle_overlays(page)
+    if not _focus_editor(page):
+        raise ContentInjectError("Editor is not available for clearing")
     page.keyboard.press("Control+A")
     smart_delay(mean=0.3, std=0.05)
     page.keyboard.press("Backspace")
@@ -162,6 +210,9 @@ def _clear_editor(page, editor):
 
 
 def _paste_html_with_clipboard(page, editor, html_content: str, plain_text: str) -> bool:
+    _handle_overlays(page)
+    if not _focus_editor(page):
+        return False
     wrote_clipboard = page.evaluate(
         """async ({ html, text }) => {
             try {
@@ -182,14 +233,15 @@ def _paste_html_with_clipboard(page, editor, html_content: str, plain_text: str)
     )
     if not wrote_clipboard:
         return False
-    editor.click()
     smart_delay(mean=0.5, std=0.1)
     page.keyboard.press("Control+V")
     return _wait_for_editor_content(page, plain_text, timeout=8)
 
 
 def _type_content_human_like(page, editor, plain_text: str) -> bool:
-    editor.click()
+    _handle_overlays(page)
+    if not _focus_editor(page):
+        return False
     paragraphs = [paragraph for paragraph in re.split(r"\n{2,}", plain_text) if paragraph.strip()]
     if not paragraphs and plain_text.strip():
         paragraphs = [plain_text.strip()]
@@ -231,6 +283,7 @@ def _wait_for_save_success(page, timeout: float = 12) -> bool:
 
 
 def _trigger_manual_save(page):
+    _handle_overlays(page)
     save_btn = find_element_with_fallback(page, sel.SAVE_DRAFT_SELECTORS, required=False)
     if save_btn:
         try:
@@ -240,8 +293,8 @@ def _trigger_manual_save(page):
                 return
         except Exception:
             pass
-    editor = page.locator(".ProseMirror").first
-    editor.click()
+    if not _focus_editor(page):
+        raise ContentInjectError("Editor is not available for manual save")
     page.keyboard.type(" ", delay=20)
     page.keyboard.press("Backspace")
 
@@ -395,6 +448,23 @@ def publish(
                 pass
 
 
+def _is_login_page(page) -> bool:
+    current_url = page.url
+    if any(pattern in current_url for pattern in sel.LOGIN_REDIRECT_PATTERNS):
+        return True
+    try:
+        return page.evaluate(
+            """() => {
+                const phoneInput = document.querySelector('input[placeholder="手机号"]');
+                const codeInput = document.querySelector('input[placeholder="验证码"]');
+                const loginText = document.body?.innerText?.includes('验证码登录');
+                return Boolean(phoneInput || codeInput || loginText);
+            }"""
+        )
+    except Exception:
+        return False
+
+
 def _handle_login_redirect(page, context, headless) -> bool:
     """Handle redirect to login page.
 
@@ -410,10 +480,23 @@ def _handle_login_redirect(page, context, headless) -> bool:
     Returns:
         True if authenticated and can continue, False otherwise
     """
-    current_url = page.url
-    login_patterns = ["auth/page/login", "sso.toutiao.com"]
+    settle_deadline = time.time() + 12
+    last_url = ""
+    while time.time() < settle_deadline:
+        try:
+            current_url = page.url
+            if current_url != last_url:
+                logger.info(f"Current page after navigation: {current_url}")
+                last_url = current_url
+            if _is_login_page(page):
+                break
+            if "profile_v4" in current_url or "graphic/publish" in current_url:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
 
-    if not any(pattern in current_url for pattern in login_patterns):
+    if not _is_login_page(page):
         return True
 
     # Already on login page - cookies may be invalid or expired
@@ -433,12 +516,12 @@ def _handle_login_redirect(page, context, headless) -> bool:
     while time.time() - start_time < timeout:
         try:
             current_url = page.url
-            if "profile_v4" in current_url or "graphic/publish" in current_url:
+            if not _is_login_page(page) and ("profile_v4" in current_url or "graphic/publish" in current_url):
                 logger.info("Login detected!")
                 _save_state(context)
                 return True
 
-            if PUBLISH_URL in current_url:
+            if not _is_login_page(page) and PUBLISH_URL in current_url:
                 return True
         except Exception:
             pass
@@ -463,16 +546,27 @@ def _handle_overlays(page):
     """Handle obstructing overlays."""
     logger.debug("Checking for overlays...")
 
+    removed_any = False
     for selector in sel.OVERLAY_SELECTORS:
         try:
-            elem = page.locator(selector["value"]).first
-            if elem.count() > 0 and elem.is_visible():
-                logger.info(f"Found overlay: {selector['value']}")
-                elem.click(force=True, position={"x": 10, "y": 10})
-                page.evaluate(f"document.querySelector('{selector['value']}')?.remove()")
-                smart_delay(mean=1, std=0.3)
+            removed = page.evaluate(
+                """(overlaySelector) => {
+                    const nodes = Array.from(document.querySelectorAll(overlaySelector));
+                    nodes.forEach((node) => {
+                        node.style.pointerEvents = 'none';
+                        node.remove();
+                    });
+                    return nodes.length;
+                }""",
+                selector["value"],
+            )
+            if removed:
+                removed_any = True
+                logger.info(f"Removed overlay nodes: {selector['value']} x{removed}")
         except Exception:
             pass
+    if removed_any:
+        smart_delay(mean=0.6, std=0.1)
 
 
 def _fill_title(page, title) -> bool:
@@ -480,10 +574,41 @@ def _fill_title(page, title) -> bool:
     logger.info(f"Filling title: {title[:20]}...")
 
     try:
-        elem = find_element_with_fallback(page, sel.TITLE_INPUT_SELECTORS)
-        elem.fill(title)
-        logger.info("Title filled successfully")
-        return True
+        _handle_overlays(page)
+        if not _wait_for_title_ready(page, timeout=15):
+            if _is_login_page(page):
+                raise AuthenticationError("Redirected to login page while waiting for title input")
+            raise TitleInputError("Title input is not available", details={"title": title})
+        success = page.evaluate(
+            """(value) => {
+                const target = document.querySelector("textarea[placeholder*='标题'], textarea");
+                if (!target) {
+                    return false;
+                }
+                target.focus();
+                target.value = value;
+                target.dispatchEvent(new Event('input', { bubbles: true }));
+                target.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            }""",
+            title,
+        )
+        if success and wait_for_condition(
+            page,
+            lambda: page.evaluate(
+                """(expected) => {
+                    const target = document.querySelector("textarea[placeholder*='标题'], textarea");
+                    return Boolean(target) && (target.value || '').trim() === expected;
+                }""",
+                title,
+            ),
+            timeout=5,
+            interval=0.3,
+            raise_on_fail=False,
+        ):
+            logger.info("Title filled successfully")
+            return True
+        raise TitleInputError("Failed to fill title", details={"title": title})
     except AllSelectorsFailedError as ex:
         logger.error("Failed to fill title - all selectors failed")
         raise TitleInputError("Failed to fill title", details={"title": title}) from ex
@@ -498,17 +623,19 @@ def _fill_content(page, html_content) -> bool:
     logger.info("Filling article content...")
 
     try:
-        wait_for_element(page, ".ProseMirror", timeout=10, state="attached")
-        elem = find_element_with_fallback(page, sel.CONTENT_EDITOR_SELECTORS)
+        if not _wait_for_editor_ready(page, timeout=15):
+            if _is_login_page(page):
+                raise AuthenticationError("Redirected to login page while waiting for content editor")
+            raise ContentInjectError("Content editor is not available")
         plain_text = _html_to_typable_text(html_content)
         strategies = [
-            ("clipboard paste", lambda: _paste_html_with_clipboard(page, elem, html_content, plain_text)),
-            ("human typing", lambda: _type_content_human_like(page, elem, plain_text)),
+            ("human typing", lambda: _type_content_human_like(page, None, plain_text)),
+            ("clipboard paste", lambda: _paste_html_with_clipboard(page, None, html_content, plain_text)),
         ]
 
         for strategy_name, strategy in strategies:
             logger.info(f"Trying content input strategy: {strategy_name}")
-            _clear_editor(page, elem)
+            _clear_editor(page, None)
             if strategy():
                 logger.info(f"Editor accepted content via {strategy_name}")
                 smart_delay(mean=4, std=0.6)
@@ -630,10 +757,11 @@ def _execute_publish(page) -> bool:
         if _has_visible_text(page, ["保存失败", "保存草稿失败"]):
             raise PublishError("Draft save failed, publish aborted")
 
+        _handle_overlays(page)
         initial_btn = _find_publish_button(page)
         if initial_btn:
             logger.info("Clicking initial publish button...")
-            initial_btn.click()
+            initial_btn.click(force=True)
         else:
             logger.warning("Publish button not found, attempting JS click")
             page.evaluate("document.querySelector('.publish-btn')?.click()")
@@ -679,7 +807,7 @@ def _find_publish_button(page):
     for selector in sel.PUBLISH_BUTTON_SELECTORS:
         try:
             if selector["type"] == "text":
-                elem = page.locator("button").filter(has_text=selector["value"]).last
+                elem = page.get_by_text(selector["value"], exact=False).last
             else:
                 elem = page.locator(selector["value"]).first
 
@@ -696,6 +824,7 @@ def _click_final_confirm(page) -> bool:
     while time.time() < deadline:
         for selector in sel.FINAL_CONFIRM_BUTTON_SELECTORS:
             try:
+                _handle_overlays(page)
                 if selector["type"] == "css":
                     elem = page.locator(selector["value"]).first
                 elif selector["type"] == "text":
@@ -704,7 +833,7 @@ def _click_final_confirm(page) -> bool:
                     continue
 
                 if elem.count() > 0 and elem.is_visible():
-                    elem.click()
+                    elem.click(force=True)
                     logger.info(f"Clicked final button: {selector['value']}")
                     return True
             except Exception:

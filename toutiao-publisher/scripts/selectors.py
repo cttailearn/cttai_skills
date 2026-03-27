@@ -5,9 +5,10 @@ Provides fallback selectors for robust element finding
 
 # Title input selectors
 TITLE_INPUT_SELECTORS = [
-    {"type": "css", "value": "textarea"},
+    {"type": "placeholder", "value": "请输入文章标题"},
     {"type": "placeholder", "value": "标题"},
     {"type": "css", "value": "textarea[placeholder*='标题']"},
+    {"type": "css", "value": "textarea"},
 ]
 
 # Content editor selectors (ProseMirror)
